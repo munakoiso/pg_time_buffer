@@ -31,7 +31,6 @@ pgtb_find_optimal_items_count(uint64_t left_bound,
 
     middle = (right_bound + left_bound) / 2;
     buffer_size = *buffer_item * middle;
-    data_htab_size = *data_htab_item * middle;
     data_htab_size = hash_estimate_size(middle, *data_htab_item);
 
     if (left_bound + 1 == right_bound) {
@@ -51,6 +50,57 @@ pgtb_find_optimal_items_count(uint64_t left_bound,
                                              data_htab_item,
                                              total_size);
     }
+}
+
+static void
+pgtb_get_items_count_and_sizes(uint64_t total_size,
+                                    uint64_t key_size,
+                                    uint64_t value_size,
+                                    uint64_t* htab_key_size,
+                                    int* global_vars_size,
+                                    uint64_t* data_htab_value_size,
+                                    uint64_t* buffer_item_size,
+                                    int* items_count) {
+    uint64_t actual_size;
+    uint64_t total_item_size;
+    u_int64_t max_items_count;
+    u_int64_t data_htab_item;
+
+    *global_vars_size = sizeof(pgtbGlobalInfo);
+    *htab_key_size = key_size + sizeof(pgtbKey);
+    *data_htab_value_size = *htab_key_size + value_size + sizeof(pgtbMeta);
+    *buffer_item_size = key_size;
+    actual_size = total_size - *global_vars_size;
+    /* Item size here - size of one key-value pair in all structures */
+    total_item_size = (*data_htab_value_size + *htab_key_size) + *buffer_item_size;
+    max_items_count = actual_size / total_item_size;
+    data_htab_item = *htab_key_size + *data_htab_value_size;
+    *items_count = (int)pgtb_find_optimal_items_count(0,
+                                                     max_items_count,
+                                                     buffer_item_size,
+                                                     &data_htab_item,
+                                                     &actual_size);
+    *items_count = (int)(*items_count / (actual_buckets_count + 1));
+}
+
+int pgtb_get_items_count(uint64_t total_size,
+                         uint64_t key_size,
+                         uint64_t value_size) {
+    int global_vars_size;
+    u_int64_t htab_key_size;
+    u_int64_t data_htab_value_size;
+    u_int64_t buffer_item_size;
+    int items_count;
+
+    pgtb_get_items_count_and_sizes(total_size,
+                                   key_size,
+                                   value_size,
+                                   &htab_key_size,
+                                   &global_vars_size,
+                                   &data_htab_value_size,
+                                   &buffer_item_size,
+                                   &items_count);
+    return items_count;
 }
 
 static void
@@ -98,10 +148,6 @@ pgtb_put(const char* extension_name, void* key_ptr, void* value_ptr) {
     data_ptr = hash_search(global_info_ptr->data_htab, (void *) pgtb_key_ptr, HASH_FIND, &found);
     if (!found) {
         if (global_info_ptr->bucket_fullness[global_info_ptr->current_bucket] == global_info_ptr->items_count - 1) {
-            if (!global_info_ptr->bucket_is_full) {
-                elog(WARNING, "pgtb: Bucket %d is full. That case not solved yet, skipping...",
-                     global_info_ptr->current_bucket);
-            }
             global_info_ptr->bucket_is_full = true;
             global_info_ptr->bucket_overflow_by += 1;
             pfree(pgtb_key_ptr);
@@ -120,17 +166,12 @@ pgtb_put(const char* extension_name, void* key_ptr, void* value_ptr) {
 
         global_info_ptr->bucket_fullness[global_info_ptr->current_bucket] += 1;
     } else {
-        data_ptr = hash_search(global_info_ptr->data_htab, (void *) pgtb_key_ptr, HASH_FIND, &found);
-        if (!found) {
-            elog(LOG, "pgtb: something goes wrong... key not found while pgtb_put");
-            pfree(pgtb_key_ptr);
-            LWLockRelease(&global_info_ptr->lock);
-            return;
-        }
         global_info_ptr->add((char*)data_ptr + global_info_ptr->htab_key_size, value_ptr);
     }
     *((int*)((char*)data_ptr + global_info_ptr->htab_key_size + global_info_ptr->value_size)) += 1;
+
     pfree(pgtb_key_ptr);
+
     LWLockRelease(&global_info_ptr->lock);
 }
 
@@ -140,49 +181,39 @@ pgtb_init(
         void (*add)(void*, void*),
         void (*on_delete)(void*, void*),
         int tick_interval,
-        int total_size_mb,
-        int key_size,
-        int value_size
+        u_int64_t total_size,
+        u_int64_t key_size,
+        u_int64_t value_size
         ) {
     bool found;
-    int global_vars_size;
     HASHCTL info;
     int buffer_size;
 
+    int global_vars_size;
     u_int64_t htab_key_size;
     u_int64_t data_htab_value_size;
     u_int64_t buffer_item_size;
-    u_int64_t total_item_size;
-    u_int64_t data_htab_item;
-
     int items_count;
+
     int htab_entries_count;
-    u_int64_t max_items_count;
+
     pgtbGlobalInfo *global_info = NULL;
 
     char data_htab_name[max_extension_name_length + max_additional_info_length];
-    uint64_t actual_size;
-    global_vars_size = sizeof(pgtbGlobalInfo);
 
-    htab_key_size = key_size + sizeof(pgtbKey);
-    data_htab_value_size = htab_key_size + value_size + sizeof(pgtbMeta);
-    buffer_item_size = key_size;
-    /* Leave some space free to prevent out of memory error */
-    actual_size = (uint64_t)(total_size_mb * MB) - global_vars_size;
-    /* Item size here - size of one key-value pair in all structures */
-    total_item_size = (data_htab_value_size + htab_key_size) + buffer_item_size;
-    max_items_count = actual_size / total_item_size;
-    data_htab_item = htab_key_size + data_htab_value_size;
-    items_count = (int)pgtb_find_optimal_items_count(0,
-                                                     max_items_count,
-                                                     &buffer_item_size,
-                                                     &data_htab_item,
-                                                     &actual_size);
-    items_count = (int)(items_count / (actual_buckets_count + 1));
+    pgtb_get_items_count_and_sizes(total_size,
+                                   key_size,
+                                   value_size,
+                                   &htab_key_size,
+                                   &global_vars_size,
+                                   &data_htab_value_size,
+                                   &buffer_item_size,
+                                   &items_count);
+
     elog(LOG, "pgtb: %s. Max count of items: %d", extension_name, items_count);
 
     buffer_size = buffer_item_size * items_count * (actual_buckets_count + 1);
-    LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
     pgtb_get_global_info(extension_name, buffer_size + global_vars_size, &global_info, &found);
 
     global_info->data_htab = NULL;
@@ -211,7 +242,6 @@ pgtb_init(
                                            htab_entries_count, htab_entries_count,
                                            &info,
                                            HASH_ELEM | HASH_BLOBS);
-    LWLockRelease(AddinShmemInitLock);
     pgtb_reset(false, global_info);
 }
 
@@ -221,15 +251,19 @@ pgtb_pop_key(pgtbGlobalInfo* global_info, int bucket, int key_in_bucket) {
     char *data;
     pgtbKey* key;
     int index;
+    int htab_key_size;
+    void (*on_delete)(void* key, void* value);
+    char* data_copy;
+    data_copy = palloc(global_info->htab_key_size + global_info->value_size);
 
     if (global_info == NULL)
         return;
-    LWLockAcquire(&global_info->lock, LW_EXCLUSIVE);
 
     if (key_in_bucket >= global_info->bucket_fullness[bucket]) {
-        LWLockRelease(&global_info->lock);
         return;
     }
+    on_delete = global_info->on_delete;
+    htab_key_size = global_info->htab_key_size;
     index = bucket * global_info->items_count + key_in_bucket;
     key = (pgtbKey*) palloc(global_info->htab_key_size);
     memcpy(key, (char*)&global_info->buckets + index * global_info->key_size, global_info->key_size);
@@ -239,12 +273,13 @@ pgtb_pop_key(pgtbGlobalInfo* global_info, int bucket, int key_in_bucket) {
         *((int*)((char*)data + global_info->htab_key_size + global_info->value_size)) -= 1;
         /* if count == 0 */
         if (*((int*)((char*)data + global_info->htab_key_size + global_info->value_size)) == 0) {
-            (*global_info->on_delete)(data, (char*)data + global_info->htab_key_size);
-            data = hash_search(global_info->data_htab, (void *) key, HASH_REMOVE, &found);
+            memcpy(data_copy, data, global_info->htab_key_size + global_info->value_size);
+            (*on_delete)(data_copy, (char*)data_copy + htab_key_size);
         }
+        data = hash_search(global_info->data_htab, (void *) key, HASH_REMOVE, &found);
     }
     pfree(key);
-    LWLockRelease(&global_info->lock);
+    pfree(data_copy);
 }
 
 static void
@@ -252,26 +287,24 @@ pgtb_reset(bool explicit_reset, pgtbGlobalInfo* global_info) {
     int bucket;
     int key_in_bucket;
 
-    LWLockAcquire(&global_info->reset_lock, LW_EXCLUSIVE);
     /* Wait for all locks (in case of manual reset some locks can be acquired) */
     if (!explicit_reset) {
         LWLockInitialize(&global_info->lock, LWLockNewTrancheId());
-
         LWLockAcquire(&global_info->lock, LW_EXCLUSIVE);
+
         memset(&global_info->buckets,
                0,
                global_info->buffer_size);
         memset(&global_info->bucket_fullness, 0, sizeof(global_info->bucket_fullness));
         LWLockRelease(&global_info->lock);
     }
+    LWLockAcquire(&global_info->lock, LW_EXCLUSIVE);
 
     for (bucket = 0; bucket < actual_buckets_count; ++bucket) {
         for (key_in_bucket = 0; key_in_bucket < global_info->items_count; ++key_in_bucket) {
             pgtb_pop_key(global_info, bucket, key_in_bucket);
         }
     }
-
-    LWLockAcquire(&global_info->lock, LW_EXCLUSIVE);
 
     global_info->current_bucket = 0;
 
@@ -290,11 +323,8 @@ pgtb_reset(bool explicit_reset, pgtbGlobalInfo* global_info) {
     }
     global_info->bucket_overflow_by = 0;
     global_info->bucket_is_full = false;
-
-    LWLockRelease(&global_info->lock);
-
     global_info->init_timestamp = GetCurrentTimestamp();
-    LWLockRelease(&global_info->reset_lock);
+    LWLockRelease(&global_info->lock);
 }
 
 void
@@ -309,15 +339,13 @@ pgtb_tick(const char* extension_name) {
     if (!found)
         return;
 
-    LWLockAcquire(&global_info->reset_lock, LW_EXCLUSIVE);
-    LWLockAcquire(&global_info->lock, LW_SHARED);
+    LWLockAcquire(&global_info->lock, LW_EXCLUSIVE);
+
     next_bucket = (global_info->current_bucket + 1) % actual_buckets_count;
-    LWLockRelease(&global_info->lock);
 
     for (key_in_bucket = 0; key_in_bucket < global_info->items_count; ++key_in_bucket) {
         pgtb_pop_key(global_info, next_bucket, key_in_bucket);
     }
-    LWLockAcquire(&global_info->lock, LW_EXCLUSIVE);
     stat_interval_microsec = ((int64)global_info->bucket_duration) * actual_buckets_count * 1e6;
     global_info->current_bucket = next_bucket;
     global_info->bucket_fullness[next_bucket] = 0;
@@ -326,7 +354,6 @@ pgtb_tick(const char* extension_name) {
         global_info->init_timestamp = global_info->last_update_timestamp - stat_interval_microsec;
     global_info->bucket_is_full = false;
     LWLockRelease(&global_info->lock);
-    LWLockRelease(&global_info->reset_lock);
 }
 
 void
@@ -405,11 +432,9 @@ pgtb_internal_get_stats_time_interval(pgtbGlobalInfo* global_info,
     int msec_diff;
     int current_bucket;
 
-    LWLockAcquire(&global_info->reset_lock, LW_EXCLUSIVE);
-    /* aggregate in bucket_ind = -1 all stats */
-    LWLockAcquire(&global_info->lock, LW_SHARED);
-
+    LWLockAcquire(&global_info->lock, LW_EXCLUSIVE);
     key_ptr = (pgtbKey*) palloc(global_info->htab_key_size);
+    memset(key_ptr, 0, global_info->htab_key_size);
     norm_left_ts = pgtb_normalize_ts(global_info, *timestamp_left);
     TimestampDifference(global_info->init_timestamp, norm_left_ts, &sec_diff, &msec_diff);
     bucket_time_since_init = sec_diff / global_info->bucket_duration;
@@ -436,15 +461,11 @@ pgtb_internal_get_stats_time_interval(pgtbGlobalInfo* global_info,
     bucket_index_0 = bucket_left;
     bucket_fullness = global_info->bucket_fullness[global_info->current_bucket];
     current_bucket = global_info->current_bucket;
-    LWLockRelease(&global_info->lock);
-
     for (delta_bucket = 0; delta_bucket < bucket_interval; ++delta_bucket) {
         bucket_index = (bucket_index_0 + delta_bucket) % actual_buckets_count;
         for (key_index = 0; key_index < global_info->items_count; ++key_index) {
-            LWLockAcquire(&global_info->lock, LW_EXCLUSIVE);
             if ((bucket_index == current_bucket && key_index == bucket_fullness) ||
                 (bucket_index != current_bucket && key_index == global_info->bucket_fullness[bucket_index])) {
-                LWLockRelease(&global_info->lock);
                 break;
             }
 
@@ -455,8 +476,6 @@ pgtb_internal_get_stats_time_interval(pgtbGlobalInfo* global_info,
             data = hash_search(global_info->data_htab, (void *) key_ptr, HASH_FIND, &found);
             if (!found) {
                 /* Should never reach that place */
-                elog(WARNING, "pgtb: Key from data not found");
-                LWLockRelease(&global_info->lock);
                 continue;
             }
             *((int*)((char*)key_ptr + global_info->key_size)) = -1;
@@ -469,7 +488,6 @@ pgtb_internal_get_stats_time_interval(pgtbGlobalInfo* global_info,
             } else {
                 global_info->add((char*)data_tmp + global_info->htab_key_size, (char*)data + global_info->htab_key_size);
             }
-            LWLockRelease(&global_info->lock);
         }
     }
 
@@ -478,10 +496,8 @@ pgtb_internal_get_stats_time_interval(pgtbGlobalInfo* global_info,
     for (delta_bucket = 0; delta_bucket < bucket_interval; ++delta_bucket) {
         bucket_index = (bucket_index_0 + delta_bucket) % actual_buckets_count;
         for (key_index = 0; key_index < global_info->items_count; ++key_index) {
-            LWLockAcquire(&global_info->lock, LW_EXCLUSIVE);
             if ((bucket_index == current_bucket && key_index == bucket_fullness) ||
                (bucket_index != current_bucket && key_index == global_info->bucket_fullness[bucket_index])) {
-                LWLockRelease(&global_info->lock);
                 break;
             }
             index = bucket_index * global_info->items_count + key_index;
@@ -499,12 +515,11 @@ pgtb_internal_get_stats_time_interval(pgtbGlobalInfo* global_info,
                 *count += 1;
                 data = hash_search(global_info->data_htab, (void *) key_ptr, HASH_REMOVE, &found);
             }
-
-            LWLockRelease(&global_info->lock);
         }
     }
+
     pfree(key_ptr);
-    LWLockRelease(&global_info->reset_lock);
+    LWLockRelease(&global_info->lock);
     return;
 }
 
