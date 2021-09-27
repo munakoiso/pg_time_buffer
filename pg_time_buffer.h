@@ -40,8 +40,8 @@ typedef struct pgtbGlobalInfo {
     TimestampTz init_timestamp;
     TimestampTz last_update_timestamp;
 
-    LWLock lock;
-    LWLock reset_lock;
+    LWLock value_htab_lock;
+    LWLock buffer_lock;
 
     int buffer_size;
     int stats_size;
@@ -69,5 +69,4 @@ void pgtb_put(const char*, void*, void*);
 void pgtb_tick(const char*);
 void pgtb_get_stats(const char*, void*, int*, TimestampTz*, TimestampTz*);
 void pgtb_get_stats_time_interval(const char*, TimestampTz*, TimestampTz*, void*, int*);
-void pgtb_reset_stats(const char*);
 int pgtb_get_items_count(uint64_t, uint64_t, uint64_t);
