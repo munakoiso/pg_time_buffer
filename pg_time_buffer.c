@@ -128,7 +128,7 @@ pgtb_get_global_info(const char* extension_name, int size, pgtbGlobalInfo** glob
     *global_info = ShmemInitStruct(global_vars_name, *size_ptr, found);
 }
 
-void
+bool
 pgtb_put(const char* extension_name, void* key_ptr, void* value_ptr) {
     pgtbGlobalInfo* global_info_ptr;
     pgtbKey* pgtb_key_ptr;
@@ -137,7 +137,7 @@ pgtb_put(const char* extension_name, void* key_ptr, void* value_ptr) {
     int index;
     pgtb_get_global_info(extension_name, 0, &global_info_ptr, &found);
     if (!found) {
-        return;
+        return false;
     }
     LWLockAcquire(&global_info_ptr->buffer_lock, LW_EXCLUSIVE);
     LWLockAcquire(&global_info_ptr->value_htab_lock, LW_EXCLUSIVE);
@@ -146,15 +146,25 @@ pgtb_put(const char* extension_name, void* key_ptr, void* value_ptr) {
     *((int*)((char*)pgtb_key_ptr + global_info_ptr->key_size)) = global_info_ptr->current_bucket;
     data_ptr = hash_search(global_info_ptr->data_htab, (void *) pgtb_key_ptr, HASH_FIND, &found);
     if (!found) {
-        if (global_info_ptr->bucket_fullness[global_info_ptr->current_bucket] == global_info_ptr->items_count - 1) {
-            global_info_ptr->bucket_is_full = true;
-            global_info_ptr->bucket_overflow_by += 1;
+        if (global_info_ptr->bucket_fullness[global_info_ptr->current_bucket] == global_info_ptr->items_count - 1 ||
+                global_info_ptr->out_of_shared_memory) {
+            if (global_info_ptr->bucket_fullness[global_info_ptr->current_bucket] == global_info_ptr->items_count - 1) {
+                global_info_ptr->bucket_is_full = true;
+                global_info_ptr->bucket_overflow_by += 1;
+            }
             pfree(pgtb_key_ptr);
             LWLockRelease(&global_info_ptr->value_htab_lock);
             LWLockRelease(&global_info_ptr->buffer_lock);
-            return;
+            return false;
         }
-        data_ptr = hash_search(global_info_ptr->data_htab, (void *) pgtb_key_ptr, HASH_ENTER, &found);
+        data_ptr = hash_search(global_info_ptr->data_htab, (void *) pgtb_key_ptr, HASH_ENTER_NULL, &found);
+        if (data_ptr == NULL) {
+            global_info_ptr->out_of_shared_memory = true;
+            pfree(pgtb_key_ptr);
+            LWLockRelease(&global_info_ptr->value_htab_lock);
+            LWLockRelease(&global_info_ptr->buffer_lock);
+            return false;
+        }
         memcpy(data_ptr, pgtb_key_ptr, global_info_ptr->htab_key_size);
         memcpy((char*)data_ptr + global_info_ptr->htab_key_size, value_ptr, global_info_ptr->value_size);
 
@@ -172,6 +182,7 @@ pgtb_put(const char* extension_name, void* key_ptr, void* value_ptr) {
     pfree(pgtb_key_ptr);
     LWLockRelease(&global_info_ptr->value_htab_lock);
     LWLockRelease(&global_info_ptr->buffer_lock);
+    return true;
 }
 
 void
@@ -228,6 +239,7 @@ pgtb_init(
     memcpy(&global_info->extension_name, extension_name, max_extension_name_length);
     global_info->add = add;
     global_info->on_delete = on_delete;
+    global_info->out_of_shared_memory = false;
 
     htab_entries_count = items_count * (actual_buckets_count + 1);
     memset(&info, 0, sizeof(info));
@@ -322,6 +334,10 @@ pgtb_tick(const char* extension_name) {
              global_info->extension_name,
              global_info->bucket_overflow_by,
              (float)global_info->bucket_overflow_by / (global_info->items_count + 1) * 100);
+    }
+    if (global_info->out_of_shared_memory) {
+        elog(WARNING, "pgtb: Out of shared memory");
+        global_info->out_of_shared_memory = false;
     }
     global_info->bucket_overflow_by = 0;
     global_info->bucket_is_full = false;
@@ -467,7 +483,12 @@ pgtb_internal_get_stats_time_interval(pgtbGlobalInfo* global_info,
                     }
                     break;
                 }
-                data_tmp = hash_search(global_info->data_htab, (void *) key_ptr, HASH_ENTER, &found);
+                data_tmp = hash_search(global_info->data_htab, (void *) key_ptr, HASH_ENTER_NULL, &found);
+                if (data_tmp == NULL) {
+                    global_info->out_of_shared_memory = true;
+                    elog(ERROR, "pgtb: Out of shared memory");
+                    break;
+                }
                 memcpy(data_tmp, data, global_info->data_htab_value_size);
 
                 *((int*)((char*)data_tmp + global_info->key_size)) = -1;

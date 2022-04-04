@@ -32,6 +32,7 @@ typedef struct pgtbGlobalInfo {
     /* count of keys in one bucket */
     int items_count;
 
+    bool out_of_shared_memory;
     bool bucket_is_full;
     int bucket_overflow_by;
     char extension_name[max_extension_name_length];
@@ -65,7 +66,7 @@ void pgtb_init(const char*,
                uint64_t,
                uint64_t
                );
-void pgtb_put(const char*, void*, void*);
+bool pgtb_put(const char*, void*, void*);
 void pgtb_tick(const char*);
 void pgtb_get_stats(const char*, void*, int*, TimestampTz*, TimestampTz*);
 void pgtb_get_stats_time_interval(const char*, TimestampTz*, TimestampTz*, void*, int*);
