@@ -13,6 +13,7 @@
 #include "storage/ipc.h"
 #include "utils/builtins.h"
 #include "catalog/pg_type.h"
+#include "storage/lwlock.h"
 
 #include "pg_time_buffer_constants.h"
 
