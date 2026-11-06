@@ -9,7 +9,7 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "utils/datetime.h"
-#include "utils/dynahash.h"
+#include "utils/hsearch.h"
 #include "utils/timestamp.h"
 #include "pg_time_buffer.h"
 
@@ -273,10 +273,17 @@ pgtb_init(
     strlcpy(data_htab_name, extension_name, max_extension_name_length);
     strcat(data_htab_name, " pgtb data_htab");
     global_info->data_htab = ShmemInitHash(data_htab_name,
-                                           htab_entries_count, htab_entries_count,
+                                           htab_entries_count,
+#if PG_VERSION_NUM < 190000
+                                           htab_entries_count,
+#endif
                                            &info,
                                            HASH_ELEM | HASH_BLOBS);
+#if PG_VERSION_NUM >= 190000
+    LWLockInitialize(&global_info->lock, LWLockNewTrancheId(extension_name));
+#else
     LWLockInitialize(&global_info->lock, LWLockNewTrancheId());
+#endif
 
     memset(&global_info->buckets,
            0,
